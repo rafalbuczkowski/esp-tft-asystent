@@ -9,6 +9,10 @@
 //   krótko, bez alertu      - ręcznie zaznacza tabletkę (ekran główny)
 //   długo, na ekranie głównym - cofa ostatnią tabletkę / szklankę wody
 //   długo, na podsumowaniu  - nowy dzień (zeruje wszystkie liczniki)
+// Oba przyciski naraz, długo  - obraca ekran o 180° (USB-C z lewej / z prawej), zapamiętane.
+//   Po obrocie przyciski zamieniają się rolami, żeby "lewy" i "prawy" zostały na swoich miejscach.
+//
+// Co 30 s mały Clawd w lewym górnym rogu przez 5 s spaceruje albo "myśli". ANIM_EVERY_S 0 = wyłącz.
 //
 // Przypomnienia: wstań (siedzenie), usiądź (stanie), woda, tabletki, oczy 20-20-20.
 // Woda i oczy liczą się tylko przy biurku (nie w Przerwie). Tabletki przypominają zawsze.
@@ -17,7 +21,9 @@
 //
 // Zapis w pamięci: liczniki, tabletki, woda i oczy są zapisywane we flash (co minutę i po każdym
 // zdarzeniu), więc po odłączeniu zasilania wracają. Czas, gdy urządzenie było wyłączone, się nie liczy.
-// Nowy dzień: długo prawy przycisk na podsumowaniu albo trzymaj prawy przycisk podczas włączania.
+// Nowy dzień: długo prawy przycisk na podsumowaniu albo trzymaj przycisk GPIO35 podczas włączania.
+//   Przy starcie zawsze GPIO35, także po obrocie ekranu (wtedy pełni on rolę "lewego"),
+//   bo GPIO0 trzymany przy starcie wprowadza ESP32 w tryb wgrywania.
 //
 // Uwaga: nie trzymaj lewego przycisku podczas podłączania USB / resetu - wejdzie w tryb wgrywania.
 #include <Arduino.h>
@@ -47,6 +53,9 @@ static const uint16_t PILL_AT_MIN[MAX_PILLS] = {60, 240, 420};
 #define AUTO_AWAY_AFTER  3          // po tylu zignorowanych "WSTAN" z rzędu - automatyczna Przerwa (0 = wyłącz)
 #define UNDO_DEPTH       8          // ile ostatnich tabletek / szklanek można cofnąć
 #define TOAST_MS         1500       // jak długo widać krótki komunikat
+#define SWAP_BTNS_WHEN_FLIPPED 1    // 1 = po obrocie ekranu przyciski zamieniają się rolami
+#define ANIM_EVERY_S     30         // co ile sekund mini animacja Clawda w nagłówku (0 = wyłącz)
+#define ANIM_SHOW_MS     5000       // jak długo trwa
 #define TIME_SCALE       1          // do testów: 60 = każda sekunda liczy się jako minuta
 
 // --- zasilanie ---------------------------------------------------------------
@@ -125,7 +134,13 @@ Kind undoStack[UNDO_DEPTH];     // ostatnie tabletki / szklanki (tylko w RAM)
 int undoCount = 0;
 int ignoredSit = 0;             // zignorowane "WSTAN" z rzędu
 uint64_t sitMark = 0;           // acc[SIT] przy pierwszym zignorowanym "WSTAN"
+int eyeBreaksMark = 0;          // eyeBreaks w tym samym momencie
 uint32_t exerciseAt = 0;        // kiedy pokazać ćwiczenie (0 = nie zaplanowane)
+bool flipped = false;           // ekran obrócony o 180°
+uint32_t comboStart = 0;        // od kiedy oba przyciski są wciśnięte
+bool comboDone = false;
+int animKind = -1;              // aktualna animacja Clawda (-1 = brak)
+uint32_t animStart = 0, nextAnimAt = 0;
 const char *toastText = nullptr;
 uint32_t toastUntil = 0;
 
@@ -159,6 +174,9 @@ int pollButton(Btn &b, uint32_t now) {
 // --- logika -----------------------------------------------------------------
 uint64_t totalMs() { return acc[0] + acc[1] + acc[2]; }
 uint64_t activeMs() { return acc[SIT] + acc[STAND]; }  // czas przy biurku (bez przerw)
+
+// Czy minął moment t? Działa też po przepełnieniu millis() (~49,7 dnia).
+bool reached(uint32_t now, uint32_t t) { return (int32_t)(now - t) >= 0; }
 
 void toast(const char *text, uint32_t now) {
   toastText = text;
@@ -194,8 +212,9 @@ void setMode(Mode m);
 
 // Alert zniknął sam (minął czas, nikt nie kliknął).
 void endAlert(uint32_t now) {
-  if (alertKind == K_EYES) {  // przerwa odbyta w całości
+  if (alertKind == K_EYES) {  // przerwa odbyta w całości - dopiero teraz zeruj licznik oczu
     eyeBreaks++;
+    eyeRun = 0;
     dirty = true;
   }
   bool sitIgnored = (alertKind == K_SIT);
@@ -206,6 +225,11 @@ void endAlert(uint32_t now) {
     uint64_t moved = acc[SIT] > sitMark ? acc[SIT] - sitMark : 0;
     acc[SIT] -= moved;
     acc[AWAY] += moved;
+    // activeMs() zmalało o moved - przesuń termin wody tak samo, żeby odliczanie nie "odskoczyło".
+    // Jeśli woda przypadła w czasie nieobecności, przypomni się zaraz po powrocie.
+    waterNext = waterNext > moved ? waterNext - moved : 0;
+    eyeBreaks = eyeBreaksMark;  // "przerwy na oczy" przy pustym biurku się nie liczą
+    // eyeRun zeruje setMode(AWAY)
     setMode(AWAY);
     toast("Auto przerwa", now);
   }
@@ -225,6 +249,9 @@ void confirmAlert(uint32_t now) {
       glasses++;
       pushUndo(K_WATER);
       waterNext = activeMs() + MIN_MS(WATER_EVERY_MIN);
+      break;
+    case K_EYES:  // pominięta prawym przyciskiem - nie liczy się, następna za EYES_EVERY_MIN
+      eyeRun = 0;
       break;
     default:
       break;
@@ -343,7 +370,10 @@ void tick(uint32_t now) {
     sitRun += dt;
     if (sitRun >= nextRemind && raise(K_SIT, now, ALERT_SHOW_MS)) {
       nextRemind += MIN_MS(REMIND_REPEAT_MIN);
-      if (ignoredSit == 0) sitMark = acc[SIT];  // od tego momentu ewentualnie liczymy auto-przerwę
+      if (ignoredSit == 0) {  // od tego momentu ewentualnie liczymy auto-przerwę
+        sitMark = acc[SIT];
+        eyeBreaksMark = eyeBreaks;
+      }
     }
   }
   if (mode == STAND) {
@@ -361,17 +391,22 @@ void tick(uint32_t now) {
   if (pills < pillsDue() && total >= pillNext && raise(K_PILL, now, ALERT_SHOW_MS)) pillNext = total + MIN_MS(PILL_REPEAT_MIN);
   uint64_t active = activeMs();
   if (mode != AWAY && active >= waterNext && raise(K_WATER, now, ALERT_SHOW_MS)) waterNext = active + MIN_MS(WATER_REPEAT_MIN);
-  if (mode != AWAY && eyeRun >= MIN_MS(EYES_EVERY_MIN) && raise(K_EYES, now, EYES_BREAK_S * 1000UL)) eyeRun = 0;
+  // eyeRun zeruje się dopiero po odbytej przerwie (endAlert) - przerwany alert wróci później.
+  if (mode != AWAY && alertKind != K_EYES && eyeRun >= MIN_MS(EYES_EVERY_MIN))
+    raise(K_EYES, now, EYES_BREAK_S * 1000UL);
 }
 
 // --- rysowanie --------------------------------------------------------------
-// eyes: 0 - otwarte, 1 - zamknięte; look: -1..1 - kierunek patrzenia
-void drawClawd(int cx, int top, int u, int eyes, int armL, int armR, int look = 0) {
+// eyes: 0 - otwarte, 1 - zamknięte; look: -1..1 - kierunek patrzenia; legStep: -1 stoi, 0/1 krok
+void drawClawd(int cx, int top, int u, int eyes, int armL, int armR, int look = 0, int legStep = -1) {
   const int bw = 9 * u, bh = 5 * u, l = cx - bw / 2;
   spr.fillRect(l - 2 * u, top + 2 * u - armL * u, 2 * u, 2 * u, COL_ORANGE);
   spr.fillRect(l + bw, top + 2 * u - armR * u, 2 * u, 2 * u, COL_ORANGE);
   spr.fillRect(l, top, bw, bh, COL_ORANGE);
-  for (int i = 0; i < 4; i++) spr.fillRect(l + (1 + 2 * i) * u, top + bh, u, 2 * u, COL_ORANGE);
+  for (int i = 0; i < 4; i++) {
+    int lh = (legStep >= 0 && (i + legStep) % 2) ? u : 2 * u;
+    spr.fillRect(l + (1 + 2 * i) * u, top + bh, u, lh, COL_ORANGE);
+  }
   int eh = eyes ? max(1, u / 2) : 2 * u;
   int ey = top + 2 * u + (eyes ? u : 0);
   int sh = look * (u / 2);
@@ -415,8 +450,23 @@ void formatHM(uint64_t ms, char *buf, size_t n) {
 void drawHeader(uint32_t now) {
   bool blink = (now % 3200) < 140;
   int eyes = (mode == AWAY || blink) ? 1 : 0;
-  int arms = (mode == STAND) ? 1 : 0;
-  drawClawd(20, 6, 2, eyes, arms, arms);
+  int armL = (mode == STAND) ? 1 : 0, armR = armL;
+  int cx = 20, look = 0, legStep = -1;
+
+  if (animKind >= 0) {  // spokojna mini animacja raz na ANIM_EVERY_S
+    uint32_t t = now - animStart;
+    if (animKind == 0) {  // spacer w miejscu: kilka pikseli tam i z powrotem
+      uint32_t p = t % 2500;
+      bool back = p >= 1250;
+      cx = 16 + (int)(8 * (back ? 2500 - p : p) / 1250);
+      legStep = (t / 220) % 2;
+      look = back ? -1 : 1;
+    } else {  // myśli: ręka w górze, powoli patrzy w jedną i drugą stronę
+      armR = 1;
+      look = ((t / 1250) % 2) ? -1 : 1;
+    }
+  }
+  drawClawd(cx, 6, 2, eyes, armL, armR, look, legStep);
 
   spr.setTextDatum(TL_DATUM);
   spr.setTextColor(COL_DIM);
@@ -435,7 +485,7 @@ void drawHeader(uint32_t now) {
     uint16_t outline = (pending && i == pills && (now / 500) % 2 == 0) ? COL_ORANGE : COL_DIM;
     drawPill(176 + i * 20, 8, i < pills, outline);
   }
-  if (now < pillFlashUntil) spr.drawRoundRect(172, 4, 64, 16, 6, COL_ORANGE);
+  if (!reached(now, pillFlashUntil)) spr.drawRoundRect(172, 4, 64, 16, 6, COL_ORANGE);
 }
 
 void drawRows() {
@@ -560,7 +610,8 @@ void drawAlert(uint32_t now) {
   spr.setTextColor(col);
   spr.drawString(title, 112, 52, 4);
   spr.setTextColor(COL_TEXT);
-  spr.drawString(line, 112, 84, 2);
+  // za długi tekst (np. nowe ćwiczenie) - mniejsza czcionka, żeby nie wyszedł poza ramkę
+  spr.drawString(line, 112, 84, spr.textWidth(line, 2) <= 118 ? 2 : 1);
   spr.setTextColor(COL_DIM);
   spr.drawString(hint, 112, 102, 2);
 
@@ -568,6 +619,19 @@ void drawAlert(uint32_t now) {
     float p = (float)(now - alertStart) / (float)(alertUntil - alertStart);
     spr.fillRect(16, 121, (int)(208 * constrain(p, 0.0f, 1.0f)), 3, COL_ORANGE);
   }
+}
+
+// --- mini animacje Clawda w nagłówku -------------------------------------------
+static const int ANIM_COUNT = 2;  // 0 - spacer, 1 - myśli
+
+void scheduleAnim(uint32_t now) { nextAnimAt = now + ANIM_EVERY_S * 1000UL; }
+
+// --- obrót ekranu ------------------------------------------------------------
+void applyRotation() {
+  tft.setRotation(flipped ? 3 : 1);
+  bool swap = flipped && SWAP_BTNS_WHEN_FLIPPED;
+  bMode.pin = swap ? BTN_PILL : BTN_MODE;
+  bPill.pin = swap ? BTN_MODE : BTN_PILL;
 }
 
 // --- podświetlenie (PWM) -----------------------------------------------------
@@ -610,8 +674,11 @@ void setup() {
   pinMode(BTN_PILL, INPUT);  // GPIO35 - tylko wejście, pull-up jest na płytce
   randomSeed(esp_random());
 
+  prefs.begin("asystent", false);
+  flipped = prefs.getUChar("flip", 0) != 0;  // orientacja jest osobno - nie kasuje jej nowy dzień
+
   tft.init();
-  tft.setRotation(1);
+  applyRotation();
   tft.fillScreen(COL_BG);
   if (spr.createSprite(SCR_W, SCR_H) == nullptr) Serial.println("Brak pamieci na sprite!");
 
@@ -619,7 +686,6 @@ void setup() {
   setBacklight(BL_NORMAL);
   lastInput = millis();
 
-  prefs.begin("asystent", false);
   bool restored = loadState();
   if (digitalRead(BTN_PILL) == LOW) {  // prawy przycisk trzymany przy starcie = nowy dzień
     resetDay();
@@ -630,6 +696,7 @@ void setup() {
     delay(1000);
   }
   lastSave = millis();
+  scheduleAnim(millis());
   Serial.println(restored ? "Wczytano zapisany stan" : "Start z zerowymi licznikami");
 }
 
@@ -639,6 +706,23 @@ void loop() {
 
   int evL = pollButton(bMode, now);
   int evR = pollButton(bPill, now);
+
+  // Oba przyciski naraz: nie są wtedy zwykłymi kliknięciami; po LONG_PRESS_MS obrót ekranu.
+  if (bMode.down && bPill.down) {
+    bMode.longDone = bPill.longDone = true;  // po puszczeniu bez krótkiego kliknięcia
+    evL = evR = 0;
+    if (comboStart == 0) comboStart = now | 1;
+    if (!comboDone && now - comboStart >= LONG_PRESS_MS) {
+      comboDone = true;
+      flipped = !flipped;
+      applyRotation();
+      prefs.putUChar("flip", flipped ? 1 : 0);
+      toast("Ekran obrocony", now);
+    }
+  } else {
+    comboStart = 0;
+    comboDone = false;
+  }
 
   if (evL == 1) {
     setMode((Mode)((mode + 1) % 3));
@@ -655,6 +739,7 @@ void loop() {
     } else if (screen == 0 && pills < MAX_PILLS) {
       pills++;
       pushUndo(K_PILL);
+      pillNext = totalMs() + MIN_MS(1);  // kolejna zaległa tabletka nie wyskoczy w tej samej chwili
       dirty = true;
       pillFlashUntil = now + 700;
     }
@@ -671,7 +756,21 @@ void loop() {
   }
 
   tick(now);
-  if (alertKind != K_NONE && now >= alertUntil) endAlert(now);
+  if (alertKind != K_NONE && reached(now, alertUntil)) endAlert(now);
+
+  if (ANIM_EVERY_S > 0) {
+    if (animKind >= 0 && now - animStart >= ANIM_SHOW_MS) {
+      animKind = -1;
+      scheduleAnim(now);
+    } else if (animKind < 0 && reached(now, nextAnimAt)) {
+      if (alertKind != K_NONE || screen != 0) {  // pod alertem / na podsumowaniu nie ma sensu
+        nextAnimAt = now + 5000;  // spróbuj za chwilę
+      } else {
+        animKind = random(ANIM_COUNT);
+        animStart = now;
+      }
+    }
+  }
 
   if ((dirty && now - lastSave >= SAVE_DEBOUNCE_MS) || now - lastSave >= SAVE_EVERY_MS) saveState(now);
 
@@ -692,7 +791,7 @@ void loop() {
     drawSummary();
   }
   if (alertKind != K_NONE) drawAlert(now);
-  if (toastText && now < toastUntil) {
+  if (toastText && !reached(now, toastUntil)) {
     spr.fillRoundRect(30, 54, 180, 28, 6, COL_PANEL);
     spr.drawRoundRect(30, 54, 180, 28, 6, COL_ORANGE);
     spr.setTextDatum(MC_DATUM);

@@ -1,52 +1,60 @@
 # ESP TFT asystent
 
-Szkice Arduino dla płytki **LilyGO TTGO T-Display** (ESP32, ekran ST7789 1,14" 135×240, przyciski GPIO0 i GPIO35).
+**English** | [Polski](README.pl.md)
 
-| Szkic | Co robi |
+Arduino sketches for the **LilyGO TTGO T-Display** board (ESP32, 1.14" ST7789 135×240 screen, buttons on GPIO0 and GPIO35).
+
+| Sketch | What it does |
 |---|---|
-| [`ClawdTDisplay`](ClawdTDisplay/ClawdTDisplay.ino) | Test ekranu: animowana maskotka Clawd z napisami |
-| [`AsystentBiurkowy`](AsystentBiurkowy/AsystentBiurkowy.ino) | Asystent przy biurku: czas siedzenia / stania / przerw, przypomnienia o ruchu, wodzie, tabletkach i oczach |
+| [`ClawdTDisplay`](ClawdTDisplay/ClawdTDisplay.ino) | Display test: an animated Clawd mascot with typed messages |
+| [`AsystentBiurkowy`](AsystentBiurkowy/AsystentBiurkowy.ino) | Desk assistant: tracks sitting / standing / break time and reminds you to move, drink water, take pills and rest your eyes |
 
-## Wymagania (Arduino IDE)
-1. Płytki: pakiet **esp32 by Espressif Systems** (Menedżer płytek), wybierz **ESP32 Dev Module**.
-2. Biblioteka **TFT_eSPI** (Bodmer) z Menedżera bibliotek.
-3. W `Documents\Arduino\libraries\TFT_eSPI\User_Setup_Select.h`:
-   - zakomentuj `#include <User_Setup.h>`
-   - odkomentuj `#include <User_Setups/Setup25_TTGO_T_Display.h>`
-4. Zrestartuj Arduino IDE, wybierz port COM i wgraj.
-   - Upload Speed: **115200** lub **460800** (921600 bywa zawodne).
-   - Jeśli wgrywanie wisi na `Connecting...`: przytrzymaj lewy przycisk (GPIO0), naciśnij i puść RESET, puść lewy.
+> The on-screen text is in Polish (ASCII only, because the built-in TFT fonts have no Polish characters). Translations are given in the tables below.
+
+## Requirements (Arduino IDE)
+1. Boards: install the **esp32 by Espressif Systems** package (Boards Manager) and select **ESP32 Dev Module**.
+2. Library: **TFT_eSPI** (Bodmer) from the Library Manager.
+3. In `Documents\Arduino\libraries\TFT_eSPI\User_Setup_Select.h`:
+   - comment out `#include <User_Setup.h>`
+   - uncomment `#include <User_Setups/Setup25_TTGO_T_Display.h>`
+4. Restart Arduino IDE, select the COM port and upload.
+   - Upload Speed: **115200** or **460800** (921600 is often unreliable).
+   - If the upload hangs on `Connecting...`: hold the left button (GPIO0), press and release RESET, then release the left button.
 
 ## ClawdTDisplay
-- GPIO0 (lewy): stoi / spaceruje
-- GPIO35 (prawy): następna wiadomość
+- GPIO0 (left): stand still / walk around
+- GPIO35 (right): next message
 
-## AsystentBiurkowy
+## AsystentBiurkowy (desk assistant)
 
-### Przyciski
-| Przycisk | Krótko | Długo (1,5 s) |
+### Buttons
+| Button | Short press | Long press (1.5 s) |
 |---|---|---|
-| Lewy (GPIO0) | zmiana trybu: Siedzę → Stoję → Przerwa | ekran główny ↔ podsumowanie dnia |
-| Prawy (GPIO35) | potwierdza / zamyka alert; bez alertu ręcznie zaznacza tabletkę | ekran główny: cofa ostatnią tabletkę lub szklankę; podsumowanie: nowy dzień |
+| Left (GPIO0) | next mode: Sitting → Standing → Break | main screen ↔ daily summary |
+| Right (GPIO35) | confirm / dismiss an alert; with no alert, mark a pill as taken | main screen: undo the last pill or glass of water; summary: start a new day |
 
-- **Nowy dzień:** trzymaj prawy przycisk podczas włączania (lub RESET), albo długo prawy na podsumowaniu.
-- Nie trzymaj lewego przycisku przy włączaniu – płytka wejdzie w tryb wgrywania (czarny ekran; pomaga sam RESET).
+- **Rotate the screen 180°:** hold **both buttons** for 1.5 s, so the USB-C port can be on the left or on the right. The setting is remembered. After rotating, the buttons swap roles so that "left" and "right" stay where they were on screen (`SWAP_BTNS_WHEN_FLIPPED 0` disables the swap).
+- **New day:** hold GPIO35 while powering on (or pressing RESET), or long-press right on the summary screen.
+- Do not hold the left button (GPIO0) while powering on: the board enters upload mode and the screen stays black. Pressing RESET on its own brings it back.
 
-### Przypomnienia
-| Alert | Kiedy |
-|---|---|
-| WSTAN! | po 45 min ciągłego siedzenia, potem co 10 min |
-| USIADZ! | po 30 min ciągłego stania, potem co 10 min |
-| DOSYC! | po łącznie 4 h stania w ciągu dnia |
-| WODA! | co 45 min przy biurku (wstrzymane w Przerwie) |
-| TABLETKA | po 1 h, 4 h i 7 h od początku dnia |
-| W DAL! | co 20 min przy biurku – 20 s patrzenia w dal |
-| RUSZ SIE | losowe ćwiczenie 10 s po zmianie trybu |
+Screen modes: `Siedze` = sitting, `Stoje` = standing, `Przerwa` = break.
 
-- 3 zignorowane „WSTAN” bez dotknięcia przycisku → automatyczna Przerwa.
-- Przy alertach ekran pulsuje, po 5 min bez przycisków się przyciemnia.
-- Stan dnia zapisuje się we flash (co minutę i po każdym zdarzeniu), więc przetrwa odłączenie zasilania.
-- Wszystkie limity są na górze pliku `.ino` w sekcji „ustawienia”. Do testów: `TIME_SCALE 60` (sekunda liczy się jak minuta).
+### Reminders
+| Alert | Meaning | When |
+|---|---|---|
+| WSTAN! | stand up | after 45 min of continuous sitting, then every 10 min |
+| USIADZ! | sit down | after 30 min of continuous standing, then every 10 min |
+| DOSYC! | enough standing | after 4 h of standing in total during the day |
+| WODA! | drink water | every 45 min at the desk (paused during a break) |
+| TABLETKA | take a pill | after 1 h, 4 h and 7 h from the start of the day |
+| W DAL! | look far away | every 20 min at the desk, look about 6 m away for 20 s (20-20-20 rule) |
+| RUSZ SIE | move a bit | a random exercise 10 s after changing mode |
 
-### Zasilanie
-CPU 80 MHz, Bluetooth wyłączony, WiFi nieużywane, ~20 FPS z przerwami między klatkami, podświetlenie przez PWM.
+- Every 30 s the small Clawd in the top-left corner plays a calm 5-second animation: it walks a few steps back and forth, or "thinks" (raises a hand and slowly looks from side to side). `ANIM_EVERY_S 0` disables it.
+- 3 ignored "WSTAN!" alerts in a row with no button press → automatic break. The time since the first ignored alert is moved from sitting to break.
+- During alerts the backlight pulses. After 5 min without a button press the screen dims.
+- The day's state is saved to flash (every minute and after each event), so it survives a power loss.
+- All limits are at the top of the `.ino` file. For testing use `TIME_SCALE 60`, so each second counts as a minute.
+
+### Power
+CPU at 80 MHz, Bluetooth off, WiFi unused, ~20 FPS with idle time between frames, PWM backlight.
